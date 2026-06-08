@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useEffect, useRef, useState, useSyncExternalStore } from "react";
+import React, { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import {
   motion,
   useMotionTemplate,
@@ -12,9 +12,13 @@ import {
 } from "framer-motion";
 
 const TOTAL_FRAMES = 192; // 0 to 191
+const FRAME_PATHS = Array.from({ length: TOTAL_FRAMES }, (_, i) => {
+  const frameIndex = i.toString().padStart(3, "0");
+  return `/sequence/frame_${frameIndex}_delay-0.041s.png`;
+});
+const WARMUP_BATCH_SIZE = 4;
 
 export default function MacbookScrollytelling() {
-  const [images, setImages] = useState<HTMLImageElement[]>([]);
   const [loaded, setLoaded] = useState(false);
   const [showHeroOverlay, setShowHeroOverlay] = useState(true);
   const isHydrated = useSyncExternalStore(
@@ -29,57 +33,43 @@ export default function MacbookScrollytelling() {
 
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const imagesRef = useRef<(HTMLImageElement | undefined)[]>([]);
+  const loadingFramesRef = useRef<Set<number>>(new Set());
+  const loadedFramesRef = useRef(0);
   const heroPointerX = useMotionValue(0);
   const heroPointerY = useMotionValue(0);
   const heroSpringX = useSpring(heroPointerX, { stiffness: 90, damping: 28, mass: 0.4 });
   const heroSpringY = useSpring(heroPointerY, { stiffness: 90, damping: 28, mass: 0.4 });
   const heroSpotlight = useMotionTemplate`radial-gradient(620px circle at ${heroSpringX}px ${heroSpringY}px, rgba(122, 214, 255, 0.2), rgba(255, 255, 255, 0.06) 28%, transparent 66%)`;
 
-  // Preload images
-  useEffect(() => {
-    let isMounted = true;
+  const loadFrame = useCallback((index: number, onReady?: () => void) => {
+    if (index < 0 || index >= TOTAL_FRAMES) return;
 
-    const loadImages = async () => {
-      const imgArray: HTMLImageElement[] = [];
-      let loadedCount = 0;
+    const cachedImage = imagesRef.current[index];
+    if (cachedImage?.complete) {
+      onReady?.();
+      return;
+    }
 
-      const promises = Array.from({ length: TOTAL_FRAMES }).map((_, i) => {
-        return new Promise<void>((resolve, reject) => {
-          const img = new Image();
-          const frameIndex = i.toString().padStart(3, "0");
-          img.src = `/sequence/frame_${frameIndex}_delay-0.041s.png`;
+    if (loadingFramesRef.current.has(index)) return;
 
-          img.onload = () => {
-            loadedCount++;
-            if (isMounted) {
-              setLoadingProgress(Math.round((loadedCount / TOTAL_FRAMES) * 100));
-            }
-            resolve();
-          };
-          img.onerror = () => {
-            console.error(`Failed to load frame ${i}`);
-            reject();
-          };
+    loadingFramesRef.current.add(index);
 
-          imgArray[i] = img;
-        });
-      });
+    const img = new Image();
+    img.decoding = "async";
+    img.src = FRAME_PATHS[index];
 
-      try {
-        await Promise.all(promises);
-        if (isMounted) {
-          setImages(imgArray);
-          setLoaded(true);
-        }
-      } catch (error) {
-        console.error("Error preloading images:", error);
-      }
+    img.onload = () => {
+      imagesRef.current[index] = img;
+      loadingFramesRef.current.delete(index);
+      loadedFramesRef.current += 1;
+      setLoadingProgress(Math.round((loadedFramesRef.current / TOTAL_FRAMES) * 100));
+      onReady?.();
     };
 
-    loadImages();
-
-    return () => {
-      isMounted = false;
+    img.onerror = () => {
+      loadingFramesRef.current.delete(index);
+      console.error(`Failed to load frame ${index}`);
     };
   }, []);
 
@@ -90,8 +80,22 @@ export default function MacbookScrollytelling() {
 
   const frameIndex = useTransform(scrollYProgress, [0, 1], [0, TOTAL_FRAMES - 1]);
 
-  const drawFrame = (index: number) => {
-    if (!loaded || !canvasRef.current || !images[index]) return;
+  const drawFrame = useCallback((index: number) => {
+    if (!loaded || !canvasRef.current) return;
+
+    const images = imagesRef.current;
+    let img = images[index];
+
+    if (!img?.complete) {
+      loadFrame(index);
+
+      for (let distance = 1; distance < TOTAL_FRAMES; distance++) {
+        img = images[index - distance] ?? images[index + distance];
+        if (img?.complete) break;
+      }
+    }
+
+    if (!img?.complete) return;
 
     const canvas = canvasRef.current;
     const ctx = canvas.getContext("2d");
@@ -114,7 +118,6 @@ export default function MacbookScrollytelling() {
     ctx.fillStyle = "#000000";
     ctx.fillRect(0, 0, viewportWidth, viewportHeight);
 
-    const img = images[index];
     const imgRatio = img.width / img.height;
     const canvasRatio = viewportWidth / viewportHeight;
 
@@ -143,7 +146,39 @@ export default function MacbookScrollytelling() {
 
     ctx.fillStyle = "#000000";
     ctx.fillRect(watermarkX, watermarkY, watermarkWidth, watermarkHeight);
-  };
+  }, [loadFrame, loaded]);
+
+  useEffect(() => {
+    let isMounted = true;
+    let warmupTimer: number | undefined;
+
+    loadFrame(0, () => {
+      if (!isMounted) return;
+
+      setLoaded(true);
+      setLoadingProgress(100);
+      window.requestAnimationFrame(() => drawFrame(0));
+
+      let nextFrame = 1;
+      const warmupFrames = () => {
+        if (!isMounted || nextFrame >= TOTAL_FRAMES) return;
+
+        const endFrame = Math.min(nextFrame + WARMUP_BATCH_SIZE, TOTAL_FRAMES);
+        for (let index = nextFrame; index < endFrame; index++) {
+          loadFrame(index);
+        }
+        nextFrame = endFrame;
+        warmupTimer = window.setTimeout(warmupFrames, 160);
+      };
+
+      warmupTimer = window.setTimeout(warmupFrames, 250);
+    });
+
+    return () => {
+      isMounted = false;
+      if (warmupTimer) window.clearTimeout(warmupTimer);
+    };
+  }, [drawFrame, loadFrame]);
 
   useMotionValueEvent(frameIndex, "change", (latest) => {
     if (loaded) {
