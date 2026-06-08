@@ -11,8 +11,12 @@ import {
   useTransform,
 } from "framer-motion";
 
-const HERO_VIDEO_SRC = "/macbook-hero.mp4";
-const HERO_POSTER_SRC = "/sequence/frame_000_delay-0.041s.png";
+const TOTAL_FRAMES = 64;
+const FRAME_PATHS = Array.from({ length: TOTAL_FRAMES }, (_, i) => {
+  const frameIndex = (i + 1).toString().padStart(3, "0");
+  return `/sequence-webp/frame_${frameIndex}.webp`;
+});
+const WARMUP_BATCH_SIZE = 8;
 
 export default function MacbookScrollytelling() {
   const [loaded, setLoaded] = useState(false);
@@ -28,9 +32,13 @@ export default function MacbookScrollytelling() {
   const [loadingProgress, setLoadingProgress] = useState(0);
 
   const containerRef = useRef<HTMLDivElement>(null);
-  const videoRef = useRef<HTMLVideoElement>(null);
-  const pendingProgressRef = useRef(0);
-  const scrubFrameRef = useRef<number | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const imagesRef = useRef<(HTMLImageElement | undefined)[]>([]);
+  const loadingFramesRef = useRef<Set<number>>(new Set());
+  const frameReadyCallbacksRef = useRef<Map<number, Set<() => void>>>(new Map());
+  const loadedFramesRef = useRef(0);
+  const currentFrameRef = useRef(0);
+  const drawFrameRef = useRef<(index: number) => void>(() => {});
   const heroPointerX = useMotionValue(0);
   const heroPointerY = useMotionValue(0);
   const heroSpringX = useSpring(heroPointerX, { stiffness: 90, damping: 28, mass: 0.4 });
@@ -42,52 +50,172 @@ export default function MacbookScrollytelling() {
     offset: ["start start", "end end"],
   });
 
-  const scrubVideo = useCallback((progress: number) => {
-    pendingProgressRef.current = Math.min(Math.max(progress, 0), 1);
+  const loadFrame = useCallback((index: number, onReady?: () => void) => {
+    if (index < 0 || index >= TOTAL_FRAMES) return;
 
-    const video = videoRef.current;
-    if (!video || !Number.isFinite(video.duration) || video.duration <= 0) return;
-
-    if (scrubFrameRef.current !== null) {
-      window.cancelAnimationFrame(scrubFrameRef.current);
+    const cachedImage = imagesRef.current[index];
+    if (cachedImage?.complete) {
+      onReady?.();
+      return;
     }
 
-    scrubFrameRef.current = window.requestAnimationFrame(() => {
-      const duration = video.duration;
-      const targetTime = pendingProgressRef.current * Math.max(duration - 0.04, 0);
+    if (onReady) {
+      const callbacks = frameReadyCallbacksRef.current.get(index) ?? new Set<() => void>();
+      callbacks.add(onReady);
+      frameReadyCallbacksRef.current.set(index, callbacks);
+    }
 
-      if (Math.abs(video.currentTime - targetTime) > 0.025) {
-        try {
-          video.currentTime = targetTime;
-        } catch {
-          // Some browsers briefly reject seeks while media is still warming up.
-        }
-      }
-    });
-  }, []);
+    if (loadingFramesRef.current.has(index)) return;
 
-  useEffect(() => {
-    return () => {
-      if (scrubFrameRef.current !== null) {
-        window.cancelAnimationFrame(scrubFrameRef.current);
+    loadingFramesRef.current.add(index);
+
+    const img = new Image();
+    img.decoding = "async";
+    img.src = FRAME_PATHS[index];
+
+    img.onload = () => {
+      imagesRef.current[index] = img;
+      loadingFramesRef.current.delete(index);
+      loadedFramesRef.current += 1;
+      setLoadingProgress(Math.round((loadedFramesRef.current / TOTAL_FRAMES) * 100));
+
+      const callbacks = frameReadyCallbacksRef.current.get(index);
+      callbacks?.forEach((callback) => callback());
+      frameReadyCallbacksRef.current.delete(index);
+
+      if (index === currentFrameRef.current) {
+        window.requestAnimationFrame(() => drawFrameRef.current(index));
       }
+    };
+
+    img.onerror = () => {
+      loadingFramesRef.current.delete(index);
+      console.error(`Failed to load hero frame ${index}`);
     };
   }, []);
 
+  const drawFrame = useCallback((index: number) => {
+    if (!loaded || !canvasRef.current) return;
+
+    const images = imagesRef.current;
+    let img = images[index];
+
+    if (!img?.complete) {
+      loadFrame(index, () => drawFrameRef.current(index));
+      loadFrame(index - 1);
+      loadFrame(index + 1);
+
+      for (let distance = 1; distance < TOTAL_FRAMES; distance++) {
+        img = images[index - distance] ?? images[index + distance];
+        if (img?.complete) break;
+      }
+    }
+
+    if (!img?.complete) return;
+
+    const canvas = canvasRef.current;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+
+    const dpr = window.devicePixelRatio || 1;
+    const viewportWidth = window.innerWidth;
+    const viewportHeight = window.innerHeight;
+    const targetWidth = Math.round(viewportWidth * dpr);
+    const targetHeight = Math.round(viewportHeight * dpr);
+
+    if (canvas.width !== targetWidth || canvas.height !== targetHeight) {
+      canvas.width = targetWidth;
+      canvas.height = targetHeight;
+      canvas.style.width = `${viewportWidth}px`;
+      canvas.style.height = `${viewportHeight}px`;
+    }
+
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.fillStyle = "#000000";
+    ctx.fillRect(0, 0, viewportWidth, viewportHeight);
+
+    const imgRatio = img.width / img.height;
+    const canvasRatio = viewportWidth / viewportHeight;
+
+    let drawWidth, drawHeight;
+    if (canvasRatio > imgRatio) {
+      drawHeight = viewportHeight;
+      drawWidth = img.width * (viewportHeight / img.height);
+    } else {
+      drawWidth = viewportWidth;
+      drawHeight = img.height * (viewportWidth / img.width);
+    }
+
+    const x = (viewportWidth - drawWidth) / 2;
+    const y = (viewportHeight - drawHeight) / 2;
+
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = "high";
+    ctx.drawImage(img, x, y, drawWidth, drawHeight);
+
+    const watermarkWidth = drawWidth * 0.25;
+    const watermarkHeight = drawHeight * 0.15;
+    const watermarkX = x + drawWidth - watermarkWidth;
+    const watermarkY = y + drawHeight - watermarkHeight;
+
+    ctx.fillStyle = "#000000";
+    ctx.fillRect(watermarkX, watermarkY, watermarkWidth, watermarkHeight);
+  }, [loadFrame, loaded]);
+
+  useEffect(() => {
+    drawFrameRef.current = drawFrame;
+  }, [drawFrame]);
+
+  useEffect(() => {
+    let isMounted = true;
+    let warmupTimer: number | undefined;
+
+    loadFrame(0, () => {
+      if (!isMounted) return;
+
+      setLoaded(true);
+      setLoadingProgress(100);
+      window.requestAnimationFrame(() => drawFrameRef.current(0));
+
+      let nextFrame = 1;
+      const warmupFrames = () => {
+        if (!isMounted || nextFrame >= TOTAL_FRAMES) return;
+
+        const endFrame = Math.min(nextFrame + WARMUP_BATCH_SIZE, TOTAL_FRAMES);
+        for (let index = nextFrame; index < endFrame; index++) {
+          loadFrame(index);
+        }
+        nextFrame = endFrame;
+        warmupTimer = window.setTimeout(warmupFrames, 70);
+      };
+
+      warmupTimer = window.setTimeout(warmupFrames, 80);
+    });
+
+    return () => {
+      isMounted = false;
+      if (warmupTimer) window.clearTimeout(warmupTimer);
+    };
+  }, [loadFrame]);
+
   useMotionValueEvent(scrollYProgress, "change", (latest) => {
-    scrubVideo(latest);
+    currentFrameRef.current = Math.round(Math.min(Math.max(latest, 0), 1) * (TOTAL_FRAMES - 1));
+    if (loaded) {
+      drawFrame(currentFrameRef.current);
+    }
   });
 
   useMotionValueEvent(scrollYProgress, "change", (latest) => {
     setShowHeroOverlay(latest < 0.22);
   });
 
-  const handleVideoReady = useCallback(() => {
-    setLoaded(true);
-    setLoadingProgress(100);
-    scrubVideo(pendingProgressRef.current);
-    videoRef.current?.pause();
-  }, [scrubVideo]);
+  useEffect(() => {
+    if (!loaded) return;
+
+    const handleResize = () => drawFrame(currentFrameRef.current);
+    window.addEventListener("resize", handleResize);
+    return () => window.removeEventListener("resize", handleResize);
+  }, [drawFrame, loaded]);
 
   // Premium Cinematic Animations
   // Hero (0%)
@@ -158,20 +286,7 @@ export default function MacbookScrollytelling() {
           heroPointerY.set(event.clientY);
         }}
       >
-        <video
-          ref={videoRef}
-          aria-hidden="true"
-          className="block h-screen w-full object-cover"
-          muted
-          playsInline
-          preload="auto"
-          poster={HERO_POSTER_SRC}
-          src={HERO_VIDEO_SRC}
-          onCanPlay={handleVideoReady}
-          onLoadedData={handleVideoReady}
-          onLoadedMetadata={handleVideoReady}
-          onError={handleVideoReady}
-        />
+        <canvas ref={canvasRef} className="block h-screen w-full" />
         <div className="absolute inset-0 bg-[linear-gradient(90deg,rgba(0,0,0,0.94)_0%,rgba(0,0,0,0.72)_24%,rgba(0,0,0,0.18)_48%,rgba(0,0,0,0.05)_62%,rgba(0,0,0,0.58)_100%)]" />
         <motion.div className="absolute inset-0 mix-blend-screen" style={heroSpotlightStyle} />
         <motion.div
