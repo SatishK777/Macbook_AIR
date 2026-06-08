@@ -35,7 +35,11 @@ export default function MacbookScrollytelling() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const imagesRef = useRef<(HTMLImageElement | undefined)[]>([]);
   const loadingFramesRef = useRef<Set<number>>(new Set());
+  const frameReadyCallbacksRef = useRef<Map<number, Set<() => void>>>(new Map());
   const loadedFramesRef = useRef(0);
+  const loadedRef = useRef(false);
+  const currentFrameRef = useRef(0);
+  const drawFrameRef = useRef<(index: number) => void>(() => {});
   const heroPointerX = useMotionValue(0);
   const heroPointerY = useMotionValue(0);
   const heroSpringX = useSpring(heroPointerX, { stiffness: 90, damping: 28, mass: 0.4 });
@@ -51,6 +55,12 @@ export default function MacbookScrollytelling() {
       return;
     }
 
+    if (onReady) {
+      const callbacks = frameReadyCallbacksRef.current.get(index) ?? new Set<() => void>();
+      callbacks.add(onReady);
+      frameReadyCallbacksRef.current.set(index, callbacks);
+    }
+
     if (loadingFramesRef.current.has(index)) return;
 
     loadingFramesRef.current.add(index);
@@ -64,7 +74,14 @@ export default function MacbookScrollytelling() {
       loadingFramesRef.current.delete(index);
       loadedFramesRef.current += 1;
       setLoadingProgress(Math.round((loadedFramesRef.current / TOTAL_FRAMES) * 100));
-      onReady?.();
+
+      const callbacks = frameReadyCallbacksRef.current.get(index);
+      callbacks?.forEach((callback) => callback());
+      frameReadyCallbacksRef.current.delete(index);
+
+      if (loadedRef.current && index === currentFrameRef.current) {
+        window.requestAnimationFrame(() => drawFrameRef.current(index));
+      }
     };
 
     img.onerror = () => {
@@ -87,7 +104,9 @@ export default function MacbookScrollytelling() {
     let img = images[index];
 
     if (!img?.complete) {
-      loadFrame(index);
+      loadFrame(index, () => drawFrameRef.current(index));
+      loadFrame(index - 1);
+      loadFrame(index + 1);
 
       for (let distance = 1; distance < TOTAL_FRAMES; distance++) {
         img = images[index - distance] ?? images[index + distance];
@@ -149,6 +168,14 @@ export default function MacbookScrollytelling() {
   }, [loadFrame, loaded]);
 
   useEffect(() => {
+    loadedRef.current = loaded;
+  }, [loaded]);
+
+  useEffect(() => {
+    drawFrameRef.current = drawFrame;
+  }, [drawFrame]);
+
+  useEffect(() => {
     let isMounted = true;
     let warmupTimer: number | undefined;
 
@@ -156,6 +183,7 @@ export default function MacbookScrollytelling() {
       if (!isMounted) return;
 
       setLoaded(true);
+      loadedRef.current = true;
       setLoadingProgress(100);
       window.requestAnimationFrame(() => drawFrame(0));
 
@@ -181,8 +209,9 @@ export default function MacbookScrollytelling() {
   }, [drawFrame, loadFrame]);
 
   useMotionValueEvent(frameIndex, "change", (latest) => {
+    currentFrameRef.current = Math.floor(latest);
     if (loaded) {
-      drawFrame(Math.floor(latest));
+      drawFrame(currentFrameRef.current);
     }
   });
 
@@ -193,7 +222,10 @@ export default function MacbookScrollytelling() {
   useEffect(() => {
     if (loaded) {
       drawFrame(0);
-      const handleResize = () => drawFrame(Math.floor(frameIndex.get()));
+      const handleResize = () => {
+        currentFrameRef.current = Math.floor(frameIndex.get());
+        drawFrame(currentFrameRef.current);
+      };
       window.addEventListener("resize", handleResize);
       return () => window.removeEventListener("resize", handleResize);
     }
